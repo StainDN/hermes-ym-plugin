@@ -17,15 +17,20 @@
 ## Установка
 
 ```bash
-# 1. Скопировать плагин в директорию Hermes
-cp -r hermes-ym-plugin ~/.hermes/plugins/ym
-
-# 2. Убедиться что aiohttp установлен
-~/.hermes/hermes-agent/venv/bin/pip install aiohttp
-
-# 3. Включить плагин
+# Вариант 1: установка из репозитория
+hermes plugins install https://github.com/StainDN/hermes-ym-plugin
 hermes plugins enable ym
+
+# Вариант 2: вручную
+git clone https://github.com/StainDN/hermes-ym-plugin ~/.hermes/plugins/hermes-ym-plugin
+hermes plugins enable ym
+
+# aiohttp обязателен (обычно уже есть в venv Hermes)
+python3 -c "import aiohttp" || pip install aiohttp
 ```
+
+После включения плагина: заполнить `.env`, прописать `gateway.platforms.ym.enabled: true`,
+затем `hermes -p <профиль> gateway restart` и проверить в логе `✓ ym connected`.
 
 ## Конфигурация
 
@@ -51,10 +56,19 @@ gateway:
 ### Опционально
 
 ```env
-YANDEX_ALLOWED_USERS=ivan_ivanov,petr_petrov   # Список разрешённых логинов
-YANDEX_ALLOW_ALL_USERS=true                    # Разрешить всех
-YANDEX_HOME_CHANNEL=0/0/<guid>                 # Чат для cron-уведомлений (chat_id или логин)
+YANDEX_ALLOWED_USERS=0f361203-fe57-9e7f-41fd-e0e9afdf4b0a   # UUID пользователей, НЕ логины
+YANDEX_ALLOW_ALL_USERS=true                                  # Разрешить всех
+YANDEX_HOME_CHANNEL=0/0/<guid>                               # Чат для cron-уведомлений (chat_id или логин)
 ```
+
+> **`YANDEX_ALLOWED_USERS` принимает UUID, а не логины.** Ядро Hermes авторизует
+> входящее сообщение по `SessionSource.user_id`, а для этой платформы там лежит
+> `from.id` из `getUpdates` — UUID вида `0f361203-fe57-9e7f-41fd-e0e9afdf4b0a`.
+> Логин (`ivan_ivanov`) не совпадёт никогда, и гейтвей молча выбросит сообщение,
+> написав в лог `Unauthorized user: <uuid> (<ФИО>) on ym`. UUID можно вытащить из
+> лога первого отклонённого сообщения либо из `getUpdates`; он стабилен для
+> пользователя. Альтернатива — `YANDEX_ALLOW_ALL_USERS=true` (бот и так виден
+> только сотрудникам организации).
 
 ## Создание бота
 
@@ -101,6 +115,10 @@ hermes-ym-plugin/
 ## Известные особенности
 
 - **Адресация чатов:** у приватного чата в Яндекс Мессенджере нет значимого `chat_id`, поэтому ответы в личку отправляются по `login` собеседника. Групповые чаты и каналы адресуются по `chat_id` (формат `0/0/<guid>`).
+- **Bot API метод-строгий.** Эндпоинты чтения (`self/get`, `chats/getChat`) принимают **только GET** (параметры — в query string), `messages/*` — **только POST** (JSON-body). POST на `self/get` отвечает `405 http_method_not_allowed`, GET на `messages/sendText` — тем же. Адаптер выбирает метод по эндпоинту (`GET_METHODS` в `adapter.py`); при добавлении новых методов проверяйте оба варианта.
+- **`.env` парсится строго:** только `KEY=value`, без пробелов вокруг `=`. Строка `YANDEX_BOT_TOKEN = At...` не подхватится — платформа просто не запустится.
+- **Проверка токена:** `self/get` возвращает карточку бота (`login`, `id`, `organizations`). Не `ok: true` — значит проблема с токеном, смотреть лог `hermes_plugins.ym.adapter`.
+- **`YANDEX_ALLOWED_USERS` — UUID, не логин** (см. выше).
 - **Polling без long-poll:** метод `getUpdates` не поддерживает удержание соединения, поэтому адаптер опрашивает сервер с интервалом ~1 секунда и продвигает курсор `offset = max(update_id) + 1`.
 - **Лимит сообщения:** 6000 символов.
 - **`payload_id`:** каждому исходящему сообщению присваивается уникальный `payload_id` — повторные запросы с тем же ID трактуются Яндексом как дубликаты.
