@@ -1,0 +1,525 @@
+"""
+Yandex Messenger (Яндекс Мессенджер) platform adapter using the Bot API.
+
+Connects to the Yandex Messenger Bot API for inbound updates (polling) and
+uses the same API for outbound messages.
+
+The Bot API is OAuth-token based and lives at botapi.messenger.yandex.net.
+Updates are fetched with ``messages/getUpdates`` (offset-based cursor), and
+outbound text is sent with ``messages/sendText``.
+
+Note on chat addressing:
+  * Group chats and channels have a ``chat.id`` (e.g. ``0/0/<guid>``) which is
+    passed as the ``chat_id`` parameter of send methods.
+  * Private chats have NO meaningful id. The peer is identified by the user's
+    ``login``, so for DMs we target the ``login`` parameter instead.
+
+Configuration in config.yaml:
+    gateway:
+      platforms:
+        ym:
+          enabled: true
+          extra:
+            token: "At..."                 # or YANDEX_BOT_TOKEN env var
+            dm_policy: "open"              # open | allowlist | disabled
+            allow_from: ["ivan_ivanov"]
+            group_policy: "open"           # open | allowlist | disabled
+            group_allow_from: ["0/0/<guid>"]
+
+Reference: https://yandex.ru/dev/messenger/doc/ru/
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+try:
+    import aiohttp
+
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+    aiohttp = None  # type: ignore[assignment]
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.session import SessionSource
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+YANDEX_API_BASE = "https://botapi.messenger.yandex.net/bot/v1/"
+POLL_INTERVAL = 1.0  # seconds between getUpdates calls (no long-poll timeout)
+POLL_LIMIT = 100  # updates per getUpdates request
+RECONNECT_DELAY = 3  # seconds before retrying after an error
+MAX_MESSAGE_LENGTH = 6000  # Yandex Messenger text limit
+
+PLATFORM_NAME = "ym"
+
+
+def _is_group_chat_id(chat_id: str) -> bool:
+    """True when *chat_id* addresses a group chat / channel rather than a user login.
+
+    Group and channel ids look like ``0/0/<guid>`` (they contain a slash); user
+    logins never do. This lets ``send()`` pick the right send parameter.
+    """
+    return "/" in str(chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+class YandexAdapter(BasePlatformAdapter):
+    """Yandex Messenger adapter using the Bot API (polling)."""
+
+    supports_code_blocks: bool = False
+    typed_command_prefix: str = "/"
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config, Platform(PLATFORM_NAME))
+
+        extra = config.extra or {}
+
+        # Auth
+        self.token = os.getenv("YANDEX_BOT_TOKEN") or extra.get("token", "")
+
+        # Access policy
+        self.dm_policy = extra.get("dm_policy", "open")
+        self.group_policy = extra.get("group_policy", "open")
+        self.allow_from: List[str] = extra.get("allow_from", [])
+        self.group_allow_from: List[str] = extra.get("group_allow_from", [])
+
+        # Env-based allowlist
+        env_allowed = os.getenv("YANDEX_ALLOWED_USERS", "").strip()
+        if env_allowed:
+            self.allow_from = [uid.strip() for uid in env_allowed.split(",") if uid.strip()]
+        self.allow_all = os.getenv("YANDEX_ALLOW_ALL_USERS", "").strip().lower() == "true"
+
+        # Polling state
+        self._offset: int = 0
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._bot_id: Optional[str] = None
+        self._bot_login: Optional[str] = None
+
+        # Rate limiting
+        self._last_api_call: float = 0
+        self._api_call_delay: float = 0.34  # ~3 calls per second
+
+        # Learned chat addressing: chat_id -> "dm" | "group"
+        self._chat_types: Dict[str, str] = {}
+        # Cache of known users: user id (GUID) -> display name
+        self._user_cache: Dict[str, str] = {}
+
+    # ── Access policy ────────────────────────────────────────────────────
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        return self.dm_policy == "allowlist" or self.group_policy == "allowlist"
+
+    def _is_user_allowed(self, user_id: str, chat_type: str) -> bool:
+        """Check if a user is allowed to interact with the bot."""
+        if self.allow_all:
+            return True
+
+        if chat_type == "dm":
+            if self.dm_policy == "disabled":
+                return False
+            if self.dm_policy == "allowlist":
+                return user_id in self.allow_from
+            return True  # "open"
+
+        if chat_type == "group":
+            if self.group_policy == "disabled":
+                return False
+            if self.group_policy == "allowlist":
+                return user_id in self.group_allow_from
+            return True  # "open"
+
+        return True
+
+    # ── Yandex Bot API helpers ──────────────────────────────────────────
+
+    async def _api_request(
+        self, method: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Make a Yandex Messenger Bot API request with rate limiting.
+
+        Returns the parsed JSON body (or a synthetic ``{"ok": False, ...}`` on
+        transport failure).
+        """
+        if not AIOHTTP_AVAILABLE:
+            logger.error("aiohttp is not installed — cannot make Yandex API requests")
+            return {"ok": False, "description": "aiohttp not installed"}
+
+        # Rate limiting
+        now = time.monotonic()
+        since_last = now - self._last_api_call
+        if since_last < self._api_call_delay:
+            await asyncio.sleep(self._api_call_delay - since_last)
+        self._last_api_call = time.monotonic()
+
+        url = f"{YANDEX_API_BASE}{method}/"
+        headers = {
+            "Authorization": f"OAuth {self.token}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with self._session.post(
+                url,
+                json=params or {},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+        except asyncio.TimeoutError:
+            logger.warning("Yandex API request timed out: %s", method)
+            return {"ok": False, "description": "timeout"}
+        except aiohttp.ClientError as e:
+            logger.warning("Yandex API request failed: %s — %s", method, e)
+            return {"ok": False, "description": str(e)}
+        except Exception as e:
+            logger.warning("Yandex API request error: %s — %s", method, e)
+            return {"ok": False, "description": str(e)}
+
+        if not data.get("ok", False):
+            logger.warning(
+                "Yandex API error [%s]: %s", method, data.get("description", "unknown")
+            )
+
+        return data
+
+    async def _get_bot_info(self) -> bool:
+        """Fetch bot identity via ``self/get`` (also validates the token)."""
+        data = await self._api_request("self/get")
+        if not data.get("ok"):
+            logger.error("Failed to get bot info: %s", data.get("description"))
+            return False
+        self._bot_id = data.get("id")
+        self._bot_login = data.get("login")
+        logger.info(
+            "Connected as Yandex Messenger bot login=%s id=%s",
+            self._bot_login, self._bot_id,
+        )
+        return True
+
+    async def _get_chat_title(self, chat_id: str) -> str:
+        """Get the title of a group chat or channel via ``chats/getChat``."""
+        data = await self._api_request("chats/getChat", {"chat_id": chat_id})
+        if data.get("ok"):
+            chat = data.get("data", {})
+            title = chat.get("name") or chat.get("title")
+            if title:
+                return title
+        return chat_id
+
+    # ── Polling loop ───────────────────────────────────────────────────
+
+    async def _poll_loop(self) -> None:
+        """Main polling loop — receives updates via ``messages/getUpdates``."""
+        while self._running:
+            data = await self._api_request(
+                "messages/getUpdates",
+                {"limit": POLL_LIMIT, "offset": self._offset},
+            )
+
+            if not data.get("ok", False):
+                await asyncio.sleep(RECONNECT_DELAY)
+                continue
+
+            updates = data.get("updates", []) or []
+            if not updates:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            logger.info("Received %d Yandex Messenger updates", len(updates))
+
+            max_update_id = self._offset - 1
+            for update in updates:
+                try:
+                    await self._process_update(update)
+                except Exception:
+                    logger.exception("Failed to process Yandex update: %s", update)
+                update_id = update.get("update_id")
+                if isinstance(update_id, int) and update_id > max_update_id:
+                    max_update_id = update_id
+
+            # Advance the cursor past every received update so the server can
+            # forget them (getUpdates drops updates with update_id < offset).
+            self._offset = max_update_id + 1
+
+    async def _process_update(self, update: dict) -> None:
+        """Process a single inbound update.
+
+        Only text messages are handled. Stickers, files, images, reactions and
+        membership events are ignored.
+        """
+        text = (update.get("text") or "").strip()
+        if not text:
+            return
+
+        sender = update.get("from") or {}
+        chat = update.get("chat") or {}
+
+        # Ignore messages sent by bots (including our own) to avoid echo loops.
+        if sender.get("robot"):
+            return
+        if self._bot_id and sender.get("id") == self._bot_id:
+            return
+
+        chat_type_raw = chat.get("type")
+        from_id = str(sender.get("id", ""))
+        display_name = sender.get("display_name") or sender.get("login") or from_id
+        message_id = update.get("message_id", 0)
+
+        if chat_type_raw == "private":
+            # Private chat has no meaningful id — address the peer by login.
+            login = sender.get("login")
+            if not login:
+                logger.debug("Skipping private message without sender login")
+                return
+            chat_type = "dm"
+            chat_id = login
+            user_id = from_id
+            user_name = display_name
+            chat_name = display_name
+            display_text = text
+        elif chat_type_raw in ("group", "channel"):
+            chat_id = str(chat.get("id", ""))
+            if not chat_id:
+                logger.debug("Skipping %s message without chat id", chat_type_raw)
+                return
+            chat_type = "group"
+            user_id = from_id
+            user_name = display_name
+            chat_name = chat_id
+            # In group chats, prefix with the user's name (as VK adapter does).
+            display_text = f"[{display_name}] {text}" if display_name else text
+        else:
+            logger.debug("Ignored Yandex chat type: %s", chat_type_raw)
+            return
+
+        # Access control
+        if not self._is_user_allowed(user_id, chat_type):
+            logger.info("User %s not allowed (chat_type=%s)", user_id, chat_type)
+            return
+
+        # Remember how to address this chat on the way out.
+        self._chat_types[chat_id] = chat_type
+        self._user_cache[user_id] = display_name
+
+        event = MessageEvent(
+            text=display_text,
+            message_type=MessageType.TEXT,
+            message_id=str(message_id),
+            raw_message=update,
+        )
+
+        event.source = SessionSource(
+            platform=Platform(PLATFORM_NAME),
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name=user_name,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            message_id=str(message_id),
+        )
+
+        # Forward to Hermes
+        await self.handle_message(event)
+
+    # ── BasePlatformAdapter interface ───────────────────────────────────
+
+    async def connect(self, is_reconnect: bool = False) -> bool:
+        """Connect to the Yandex Messenger Bot API and start polling."""
+        if not AIOHTTP_AVAILABLE:
+            logger.error(
+                "aiohttp is required for Yandex Messenger adapter. "
+                "Install: pip install aiohttp"
+            )
+            return False
+
+        if not self.token:
+            logger.error(
+                "YANDEX_BOT_TOKEN is not set. "
+                "Set it in .env or config.yaml (gateway.platforms.ym.extra.token)"
+            )
+            return False
+
+        self._session = aiohttp.ClientSession()
+
+        # Validate the token and learn our own identity.
+        if not await self._get_bot_info():
+            await self._session.close()
+            self._session = None
+            return False
+
+        self._mark_connected()
+
+        # Start polling in background
+        self._poll_task = asyncio.create_task(self._poll_loop())
+
+        logger.info(
+            "Yandex Messenger adapter connected (dm_policy=%s, group_policy=%s)",
+            self.dm_policy, self.group_policy,
+        )
+        return True
+
+    async def disconnect(self) -> None:
+        """Disconnect from the Yandex Messenger Bot API."""
+        self._running = False
+
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
+
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+        self._mark_disconnected()
+        logger.info("Yandex Messenger adapter disconnected")
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a text message to a Yandex Messenger chat."""
+        if not content:
+            return SendResult(success=True, message_id=None)
+
+        content = content[:MAX_MESSAGE_LENGTH]
+
+        params: Dict[str, Any] = {
+            "text": content,
+            "payload_id": f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+        }
+
+        # Group/channel → chat_id param; private chat → login param.
+        if _is_group_chat_id(chat_id) or self._chat_types.get(chat_id) == "group":
+            params["chat_id"] = chat_id
+        else:
+            params["login"] = chat_id
+
+        if reply_to:
+            try:
+                params["reply_message_id"] = int(reply_to)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring non-numeric reply_to: %s", reply_to)
+
+        data = await self._api_request("messages/sendText", params)
+
+        if not data.get("ok", False):
+            logger.warning(
+                "Failed to send message to %s: %s", chat_id, data.get("description")
+            )
+            return SendResult(
+                success=False,
+                error=f"Yandex API error: {data.get('description', 'unknown')}",
+            )
+
+        msg_id = data.get("message_id")
+        return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
+
+    async def send_typing(self, chat_id: str) -> None:
+        """Show typing indicator in a Yandex Messenger chat."""
+        if _is_group_chat_id(chat_id) or self._chat_types.get(chat_id) == "group":
+            params: Dict[str, Any] = {"chat_id": chat_id}
+        else:
+            params = {"login": chat_id}
+        await self._api_request("messages/sendTyping", params)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """Get information about a Yandex Messenger chat."""
+        if _is_group_chat_id(chat_id) or self._chat_types.get(chat_id) == "group":
+            title = await self._get_chat_title(chat_id)
+            return {"name": title, "type": "group", "chat_id": chat_id}
+
+        # DM — we only know the login; reuse a cached display name if present.
+        for uid, name in self._user_cache.items():
+            if name == chat_id:
+                return {"name": name, "type": "dm", "chat_id": chat_id}
+        return {"name": chat_id, "type": "dm", "chat_id": chat_id}
+
+    def format_message(self, content: str) -> str:
+        """Format message for Yandex Messenger. Plain text only."""
+        return content
+
+
+# ── Plugin entry point ─────────────────────────────────────────────────
+
+
+def check_requirements() -> bool:
+    """Check if Yandex Messenger adapter requirements are met."""
+    if not AIOHTTP_AVAILABLE:
+        return False
+    return bool(os.getenv("YANDEX_BOT_TOKEN"))
+
+
+def validate_config(config) -> bool:
+    """Validate Yandex Messenger adapter configuration."""
+    extra = getattr(config, "extra", {}) or {}
+    token = os.getenv("YANDEX_BOT_TOKEN") or extra.get("token", "")
+    return bool(token)
+
+
+def _env_enablement() -> Optional[Dict[str, Any]]:
+    """Auto-enable from environment variables."""
+    token = os.getenv("YANDEX_BOT_TOKEN", "").strip()
+    if not token:
+        return None
+
+    seed: Dict[str, Any] = {"token": token}
+
+    # Home channel for cron delivery
+    home = os.getenv("YANDEX_HOME_CHANNEL", "").strip()
+    if home:
+        seed["home_channel"] = {"chat_id": home, "name": "Yandex Messenger Home"}
+
+    return seed
+
+
+def register(ctx):
+    """Plugin entry point — called by the Hermes plugin system."""
+    ctx.register_platform(
+        name=PLATFORM_NAME,
+        label="Yandex Messenger",
+        adapter_factory=lambda cfg: YandexAdapter(cfg),
+        check_fn=check_requirements,
+        validate_config=validate_config,
+        required_env=["YANDEX_BOT_TOKEN"],
+        install_hint="pip install aiohttp",
+        env_enablement_fn=_env_enablement,
+        cron_deliver_env_var="YANDEX_HOME_CHANNEL",
+        allowed_users_env="YANDEX_ALLOWED_USERS",
+        allow_all_env="YANDEX_ALLOW_ALL_USERS",
+        max_message_length=MAX_MESSAGE_LENGTH,
+        platform_hint=(
+            "You are chatting via Yandex Messenger (Яндекс Мессенджер). "
+            "It supports plain text messages. "
+            "Use /commands for Hermes controls."
+        ),
+        emoji="💬",
+    )

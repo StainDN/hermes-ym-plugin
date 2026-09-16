@@ -1,0 +1,24 @@
+name: ym
+label: Yandex Messenger
+kind: platform
+version: 1.0.0
+description: Yandex Messenger (Яндекс Мессенджер) platform adapter via Bot API
+license: MIT
+requires_env:
+  - name: YANDEX_BOT_TOKEN
+    description: "Yandex Messenger bot OAuth token (Яндекс 360 Bot Platform → Боты в Мессенджере)"
+    prompt: "Yandex Messenger Bot Token"
+    password: true
+optional_env:
+  - name: YANDEX_ALLOWED_USERS
+    description: "Comma-separated list of allowed Yandex Messenger user logins"
+    prompt: "Allowed Yandex Messenger Users"
+    password: false
+  - name: YANDEX_ALLOW_ALL_USERS
+    description: "Set to 'true' to allow all users to chat with the bot"
+    prompt: "Allow all users"
+    password: false
+  - name: YANDEX_HOME_CHANNEL
+    description: "Default chat ID (group chat id or user login) for cron delivery"
+    prompt: "Yandex Messenger Home Chat"
+    password: false
