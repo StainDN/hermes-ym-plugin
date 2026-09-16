@@ -37,6 +37,7 @@ import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 try:
     import aiohttp
@@ -68,6 +69,10 @@ RECONNECT_DELAY = 3  # seconds before retrying after an error
 MAX_MESSAGE_LENGTH = 6000  # Yandex Messenger text limit
 
 PLATFORM_NAME = "ym"
+
+# Endpoints that the Yandex Bot API serves over GET only; everything else is
+# POST. Sending POST to these answers 405 "HTTP method POST not allowed".
+GET_METHODS = frozenset({"self/get", "chats/getChat"})
 
 
 def _is_group_chat_id(chat_id: str) -> bool:
@@ -155,9 +160,14 @@ class YandexAdapter(BasePlatformAdapter):
     # ── Yandex Bot API helpers ──────────────────────────────────────────
 
     async def _api_request(
-        self, method: str, params: Optional[Dict[str, Any]] = None
+        self, method: str, params: Optional[Dict[str, Any]] = None,
+        http: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Make a Yandex Messenger Bot API request with rate limiting.
+
+        `http` overrides the verb; by default GET is used for the endpoints in
+        ``GET_METHODS`` and POST for everything else. GET parameters are sent as
+        a query string, POST parameters as a JSON body.
 
         Returns the parsed JSON body (or a synthetic ``{"ok": False, ...}`` on
         transport failure).
@@ -178,14 +188,22 @@ class YandexAdapter(BasePlatformAdapter):
             "Authorization": f"OAuth {self.token}",
             "Content-Type": "application/json",
         }
+        verb = (http or ("GET" if method in GET_METHODS else "POST")).upper()
+        timeout = aiohttp.ClientTimeout(total=30)
 
         try:
-            async with self._session.post(
-                url,
-                json=params or {},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
+            if verb == "GET":
+                if params:
+                    url = f"{url}?{urlencode(params)}"
+                request = self._session.get(url, headers=headers, timeout=timeout)
+            else:
+                request = self._session.post(
+                    url,
+                    json=params or {},
+                    headers=headers,
+                    timeout=timeout,
+                )
+            async with request as resp:
                 data = await resp.json(content_type=None)
         except asyncio.TimeoutError:
             logger.warning("Yandex API request timed out: %s", method)
