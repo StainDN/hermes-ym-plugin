@@ -176,6 +176,10 @@ class YandexAdapter(BasePlatformAdapter):
         self._chat_kinds: Dict[str, str] = {}
         # Cache of known users: user id (GUID) -> display name
         self._user_cache: Dict[str, str] = {}
+        # Thread ids created by auto-threading (not yet "activated" by a
+        # successful sendText). Typing indicator for these goes to the main
+        # chat, because the thread doesn't exist on Yandex's side yet.
+        self._pending_threads: set = set()
 
     # ── Access policy ────────────────────────────────────────────────────
 
@@ -463,6 +467,7 @@ class YandexAdapter(BasePlatformAdapter):
             )
             if auto_thread and message_id:
                 thread_id = str(int(message_id))
+                self._pending_threads.add(thread_id)
 
         # Access control
         if not self._is_user_allowed(user_id, chat_type):
@@ -627,6 +632,11 @@ class YandexAdapter(BasePlatformAdapter):
             )
 
         msg_id = data.get("message_id")
+        # Thread is now "activated" on Yandex's side — typing indicator can
+        # target it from now on.
+        tid = params.get("thread_id")
+        if tid is not None:
+            self._pending_threads.discard(str(tid))
         return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -654,6 +664,11 @@ class YandexAdapter(BasePlatformAdapter):
         # indicator lapse between refreshes.
         params["timeout"] = 6
         thread_id = self._thread_param(metadata)
+        # If the thread was just created by auto-threading and hasn't been
+        # "activated" by a successful sendText yet, show typing in the main
+        # chat — the thread doesn't exist on Yandex's side for sendTyping.
+        if thread_id is not None and thread_id in self._pending_threads:
+            thread_id = None
         if thread_id is not None:
             params["thread_id"] = thread_id
         await self._api_request("messages/sendTyping", params)
