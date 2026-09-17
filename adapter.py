@@ -13,6 +13,9 @@ Note on chat addressing:
     passed as the ``chat_id`` parameter of send methods.
   * Private chats have NO meaningful id. The peer is identified by the user's
     ``login``, so for DMs we target the ``login`` parameter instead.
+  * Messages inside a thread carry a ``thread_id`` (the timestamp of the
+    thread's root message); replies are routed back into that same thread by
+    echoing the ``thread_id`` to the send methods.
 
 Configuration in config.yaml:
     gateway:
@@ -99,6 +102,11 @@ class YandexAdapter(BasePlatformAdapter):
         super().__init__(config, Platform(PLATFORM_NAME))
 
         extra = config.extra or {}
+        if config.extra is None:
+            config.extra = extra
+        # Each message thread is an independent Hermes conversation by default
+        # (the base build_session_key keeps threads merged unless this is set).
+        extra.setdefault("thread_sessions_per_user", True)
 
         # Auth
         self.token = os.getenv("YANDEX_BOT_TOKEN") or extra.get("token", "")
@@ -247,6 +255,25 @@ class YandexAdapter(BasePlatformAdapter):
                 return title
         return chat_id
 
+    @staticmethod
+    def _thread_param(metadata) -> Optional[int]:
+        """Extract a valid integer ``thread_id`` from send metadata.
+
+        Hermes carries ``event.source.thread_id`` in ``metadata["thread_id"]``
+        as a string; the Yandex Bot API wants an integer. Returns ``None`` for
+        missing/zero/non-numeric values so the request stays thread-agnostic.
+        """
+        if not metadata:
+            return None
+        raw = metadata.get("thread_id")
+        if raw in (None, "", 0):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.debug("Ignoring non-numeric thread_id: %s", raw)
+            return None
+
     # ── Polling loop ───────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
@@ -306,6 +333,16 @@ class YandexAdapter(BasePlatformAdapter):
         display_name = sender.get("display_name") or sender.get("login") or from_id
         message_id = update.get("message_id", 0)
 
+        # Messages inside a thread carry a ``thread_id`` on the top level of the
+        # update (an integer — the timestamp of the thread's root message).
+        thread_id: Optional[str] = None
+        thread_raw = update.get("thread_id")
+        if thread_raw not in (None, "", 0):
+            try:
+                thread_id = str(int(thread_raw))
+            except (TypeError, ValueError):
+                logger.debug("Ignoring non-numeric thread_id: %s", thread_raw)
+
         if chat_type_raw == "private":
             # Private chat has no meaningful id — address the peer by login.
             login = sender.get("login")
@@ -356,6 +393,7 @@ class YandexAdapter(BasePlatformAdapter):
             user_name=user_name,
             chat_name=chat_name,
             chat_type=chat_type,
+            thread_id=thread_id,
             message_id=str(message_id),
         )
 
@@ -448,6 +486,11 @@ class YandexAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 logger.debug("Ignoring non-numeric reply_to: %s", reply_to)
 
+        # Reply inside the same thread the user wrote in, if any.
+        thread_id = self._thread_param(metadata)
+        if thread_id is not None:
+            params["thread_id"] = thread_id
+
         data = await self._api_request("messages/sendText", params)
 
         if not data.get("ok", False):
@@ -486,8 +529,9 @@ class YandexAdapter(BasePlatformAdapter):
         # Longer than the 2s heartbeat interval so a slow tick never lets the
         # indicator lapse between refreshes.
         params["timeout"] = 6
-        if metadata and metadata.get("thread_id"):
-            params["thread_id"] = metadata["thread_id"]
+        thread_id = self._thread_param(metadata)
+        if thread_id is not None:
+            params["thread_id"] = thread_id
         await self._api_request("messages/sendTyping", params)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
