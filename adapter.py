@@ -73,6 +73,15 @@ RECONNECT_DELAY = 3  # seconds before retrying after an error
 MAX_MESSAGE_LENGTH = 6000  # Yandex Messenger text limit
 TYPING_TEXT = "печатаю"  # custom processing indicator text (private chats only)
 
+# Quick-command buttons attached to every text reply (suggest_buttons). The
+# names are canonical Hermes slash commands; /commands opens Hermes' own
+# paginated browser over the full registry. Order mirrors Hermes'
+# _TELEGRAM_MENU_PRIORITY (most-typed everyday commands first).
+QUICK_COMMANDS: tuple = (
+    "help", "new", "stop", "status",
+    "resume", "sessions", "model", "commands",
+)
+
 PLATFORM_NAME = "ym"
 
 # Endpoints that the Yandex Bot API serves over GET only; everything else is
@@ -124,6 +133,15 @@ class YandexAdapter(BasePlatformAdapter):
         if self.thread_replies not in ("all", "group", "off"):
             self.thread_replies = "group"
 
+        # Quick-command buttons (suggest_buttons) under every text reply.
+        # ``quick_commands: false`` turns them off; ``quick_commands_persist``
+        # keeps the buttons visible even after newer messages arrive. The
+        # button set is built from the live Hermes command registry, falling
+        # back to QUICK_COMMANDS if it can't be imported.
+        self.quick_commands = bool(extra.get("quick_commands", True))
+        self.quick_commands_persist = bool(extra.get("quick_commands_persist", True))
+        self._quick_buttons_cache: Optional[dict] = None
+
         # Auth
         self.token = os.getenv("YANDEX_BOT_TOKEN") or extra.get("token", "")
 
@@ -152,6 +170,10 @@ class YandexAdapter(BasePlatformAdapter):
 
         # Learned chat addressing: chat_id -> "dm" | "group"
         self._chat_types: Dict[str, str] = {}
+        # Raw Yandex chat kind: chat_id -> "private" | "group" | "channel"
+        # (channels are collapsed to "group" in _chat_types; quick-command
+        # buttons are suppressed for channels, so we keep the raw kind too).
+        self._chat_kinds: Dict[str, str] = {}
         # Cache of known users: user id (GUID) -> display name
         self._user_cache: Dict[str, str] = {}
 
@@ -290,6 +312,48 @@ class YandexAdapter(BasePlatformAdapter):
             logger.debug("Ignoring non-numeric thread_id: %s", raw)
             return None
 
+    def _quick_command_buttons(self) -> dict:
+        """Build the ``suggest_buttons`` keyboard with Hermes slash commands.
+
+        Command names come from the live Hermes registry (``hermes_cli.commands``)
+        so the menu tracks the installed version; if that import is unavailable
+        we fall back to :data:`QUICK_COMMANDS`. Buttons carry a ``send_message``
+        directive, so pressing one is equivalent to the user typing the command
+        (``/help`` etc.) — the gateway then routes it to the normal
+        slash-command handler. Cached after first build.
+        """
+        if self._quick_buttons_cache is not None:
+            return self._quick_buttons_cache
+
+        available: set = set()
+        try:
+            from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available
+            available = {
+                cmd.name for cmd in COMMAND_REGISTRY
+                if _is_gateway_available(cmd)
+            }
+        except Exception as exc:  # registry moved/unavailable — keep the menu
+            logger.debug("Quick commands: Hermes registry unavailable (%s)", exc)
+
+        names = [n for n in QUICK_COMMANDS if not available or n in available]
+        if not names:
+            names = list(QUICK_COMMANDS)
+
+        buttons = [
+            {
+                "id": name,
+                "title": f"/{name}",
+                "directives": [{"type": "send_message", "text": f"/{name}"}],
+            }
+            for name in names
+        ]
+        self._quick_buttons_cache = {
+            "layout": "true",
+            "persist": self.quick_commands_persist,
+            "buttons": [buttons[i:i + 4] for i in range(0, len(buttons), 4)],
+        }
+        return self._quick_buttons_cache
+
     # ── Polling loop ───────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
@@ -407,6 +471,7 @@ class YandexAdapter(BasePlatformAdapter):
 
         # Remember how to address this chat on the way out.
         self._chat_types[chat_id] = chat_type
+        self._chat_kinds[chat_id] = chat_type_raw
         self._user_cache[user_id] = display_name
 
         event = MessageEvent(
@@ -541,6 +606,11 @@ class YandexAdapter(BasePlatformAdapter):
         # the thread_id already anchors the conversation context.
         if thread_id is not None and "reply_message_id" in params:
             params.pop("reply_message_id", None)
+
+        # Quick-command buttons under the reply. Skipped in channels (menus
+        # don't fit there); attached to text replies only.
+        if self.quick_commands and self._chat_kinds.get(chat_id) != "channel":
+            params["suggest_buttons"] = self._quick_command_buttons()
 
         logger.debug(
             "ym sendText target=%s thread_id=%s reply=%s content_len=%d",
