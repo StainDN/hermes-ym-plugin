@@ -108,6 +108,13 @@ class YandexAdapter(BasePlatformAdapter):
         # (the base build_session_key keeps threads merged unless this is set).
         extra.setdefault("thread_sessions_per_user", True)
 
+        # Auto-thread replies: on a message from the main chat the bot opens a
+        # new thread under that message. "group" — group chats only, "all" —
+        # also private chats, "off" — reply inline as before.
+        self.thread_replies = str(extra.get("thread_replies", "group")).lower()
+        if self.thread_replies not in ("all", "group", "off"):
+            self.thread_replies = "group"
+
         # Auth
         self.token = os.getenv("YANDEX_BOT_TOKEN") or extra.get("token", "")
 
@@ -370,6 +377,18 @@ class YandexAdapter(BasePlatformAdapter):
             logger.debug("Ignored Yandex chat type: %s", chat_type_raw)
             return
 
+        # Auto-thread: a message from the main chat (no thread_id yet) opens a
+        # new thread anchored under that message, so the reply starts the
+        # thread and the dialogue continues inside it. Scope is controlled by
+        # ``thread_replies``; channels stay inline (threads don't fit them).
+        if thread_id is None:
+            auto_thread = (
+                self.thread_replies == "all"
+                or (self.thread_replies == "group" and chat_type_raw == "group")
+            )
+            if auto_thread and message_id:
+                thread_id = str(int(message_id))
+
         # Access control
         if not self._is_user_allowed(user_id, chat_type):
             logger.info("User %s not allowed (chat_type=%s)", user_id, chat_type)
@@ -480,14 +499,20 @@ class YandexAdapter(BasePlatformAdapter):
         else:
             params["login"] = chat_id
 
+        reply_pid: Optional[int] = None
         if reply_to:
             try:
-                params["reply_message_id"] = int(reply_to)
+                reply_pid = int(reply_to)
             except (TypeError, ValueError):
                 logger.debug("Ignoring non-numeric reply_to: %s", reply_to)
 
         # Reply inside the same thread the user wrote in, if any.
         thread_id = self._thread_param(metadata)
+        # When opening a NEW thread anchored on the incoming message
+        # (thread_id == reply target), skip the redundant quote — the message
+        # is already the thread root.
+        if reply_pid is not None and not (thread_id is not None and thread_id == reply_pid):
+            params["reply_message_id"] = reply_pid
         if thread_id is not None:
             params["thread_id"] = thread_id
 
