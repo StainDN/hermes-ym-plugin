@@ -35,6 +35,7 @@ Reference: https://yandex.ru/dev/messenger/doc/ru/
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -111,6 +112,14 @@ class YandexAdapter(BasePlatformAdapter):
         # Auto-thread replies: on a message from the main chat the bot opens a
         # new thread under that message. "group" — group chats only, "all" —
         # also private chats, "off" — reply inline as before.
+        # Default to "group": on a message from the main chat the bot opens a
+        # thread under it, and replies inside the thread stay routed by the
+        # thread anchor (thread_id = the main-chat message id that rooted the
+        # thread). The send() safety (drop reply_message_id when thread_id is
+        # present) keeps the Bot API happy — it rejects a thread_id paired with
+        # reply_message_id, and rejects an in-thread message id used as the
+        # thread anchor. "all" — also auto-thread private chats; "off" — reply
+        # inline as before (no threads).
         self.thread_replies = str(extra.get("thread_replies", "group")).lower()
         if self.thread_replies not in ("all", "group", "off"):
             self.thread_replies = "group"
@@ -233,7 +242,7 @@ class YandexAdapter(BasePlatformAdapter):
 
         if not data.get("ok", False):
             logger.warning(
-                "Yandex API error [%s]: %s", method, data.get("description", "unknown")
+                "Yandex API error [%s] params=%s: %s", method, params, data.get("description", "unknown")
             )
 
         return data
@@ -340,15 +349,17 @@ class YandexAdapter(BasePlatformAdapter):
         display_name = sender.get("display_name") or sender.get("login") or from_id
         message_id = update.get("message_id", 0)
 
-        # Messages inside a thread carry a ``thread_id`` on the top level of the
-        # update (an integer — the timestamp of the thread's root message).
+        # Messages inside a thread carry a ``thread_id`` in the ``chat`` object.
+        # It is an integer — the timestamp of the thread's root message (anchor).
         thread_id: Optional[str] = None
-        thread_raw = update.get("thread_id")
+        thread_raw = chat.get("thread_id")
+        if thread_raw in (None, "", 0):
+            thread_raw = update.get("thread_id")
         if thread_raw not in (None, "", 0):
             try:
                 thread_id = str(int(thread_raw))
             except (TypeError, ValueError):
-                logger.debug("Ignoring non-numeric thread_id: %s", thread_raw)
+                logger.debug("Ignoring non-numeric thread_id: %r", thread_raw)
 
         if chat_type_raw == "private":
             # Private chat has no meaningful id — address the peer by login.
@@ -404,6 +415,15 @@ class YandexAdapter(BasePlatformAdapter):
             message_id=str(message_id),
             raw_message=update,
         )
+
+        # When auto-threading is off, don't propagate the inbound thread_id:
+        # replying with it would route the send into a thread (and the Bot API
+        # rejects an in-thread message id used as a thread anchor). Respond
+        # inline in the main chat instead. With threads on (group/all) the
+        # inbound thread_id is the thread's main-chat anchor and is exactly
+        # what we need to keep replying inside the thread.
+        if self.thread_replies == "off":
+            thread_id = None
 
         event.source = SessionSource(
             platform=Platform(PLATFORM_NAME),
@@ -515,9 +535,18 @@ class YandexAdapter(BasePlatformAdapter):
             params["reply_message_id"] = reply_pid
         if thread_id is not None:
             params["thread_id"] = thread_id
+        # Safety: the Bot API rejects sendText that carries BOTH thread_id and
+        # reply_message_id (and rejects reply_message_id pointing at an
+        # in-thread message). If we are routing into a thread, drop the quote —
+        # the thread_id already anchors the conversation context.
+        if thread_id is not None and "reply_message_id" in params:
+            params.pop("reply_message_id", None)
 
+        logger.debug(
+            "ym sendText target=%s thread_id=%s reply=%s content_len=%d",
+            chat_id, params.get("thread_id"), params.get("reply_message_id"), len(content),
+        )
         data = await self._api_request("messages/sendText", params)
-
         if not data.get("ok", False):
             logger.warning(
                 "Failed to send message to %s: %s", chat_id, data.get("description")
