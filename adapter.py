@@ -67,6 +67,7 @@ POLL_INTERVAL = 1.0  # seconds between getUpdates calls (no long-poll timeout)
 POLL_LIMIT = 100  # updates per getUpdates request
 RECONNECT_DELAY = 3  # seconds before retrying after an error
 MAX_MESSAGE_LENGTH = 6000  # Yandex Messenger text limit
+TYPING_TEXT = "печатаю"  # custom processing indicator text (private chats only)
 
 PLATFORM_NAME = "ym"
 
@@ -461,12 +462,32 @@ class YandexAdapter(BasePlatformAdapter):
         msg_id = data.get("message_id")
         return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
 
-    async def send_typing(self, chat_id: str) -> None:
-        """Show typing indicator in a Yandex Messenger chat."""
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Show a typing/processing indicator while the bot is generating a reply.
+
+        The base-class ``_keep_typing`` heartbeat calls this every ~2s with
+        ``metadata=`` and stops it once the reply is delivered. ``metadata``
+        must be accepted here or the heartbeat fails the call and the
+        indicator silently never appears.
+
+        Private chats use ``type=processing`` with a custom text (the only way
+        to show arbitrary status text); group chats and channels fall back to
+        the standard ``type=text`` indicator because ``processing`` is not
+        available there.
+        """
         if _is_group_chat_id(chat_id) or self._chat_types.get(chat_id) == "group":
-            params: Dict[str, Any] = {"chat_id": chat_id}
+            params: Dict[str, Any] = {"chat_id": chat_id, "type": "text"}
         else:
-            params = {"login": chat_id}
+            params = {
+                "login": chat_id,
+                "type": "processing",
+                "processing_content": {"display": "text", "text": TYPING_TEXT},
+            }
+        # Longer than the 2s heartbeat interval so a slow tick never lets the
+        # indicator lapse between refreshes.
+        params["timeout"] = 6
+        if metadata and metadata.get("thread_id"):
+            params["thread_id"] = metadata["thread_id"]
         await self._api_request("messages/sendTyping", params)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
