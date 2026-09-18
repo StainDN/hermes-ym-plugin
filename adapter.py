@@ -146,6 +146,11 @@ class YandexAdapter(BasePlatformAdapter):
             self.allow_from = [uid.strip() for uid in env_allowed.split(",") if uid.strip()]
         self.allow_all = os.getenv("YANDEX_ALLOW_ALL_USERS", "").strip().lower() == "true"
 
+        # Feed channels (e.g. an error stream) are written by OTHER bots; accept
+        # their posts in groups/channels when enabled. DMs from robots stay
+        # subject to the DM policy, so this cannot open a private back door.
+        self.allow_robot_senders = bool(extra.get("allow_robot_senders", False))
+
         # Admin-gated authorization. When enabled, only the admin, users
         # already approved in the core PairingStore, and the explicit
         # allowlists above may talk to the bot. New private-chat users get a
@@ -196,7 +201,7 @@ class YandexAdapter(BasePlatformAdapter):
             or self.group_policy == "allowlist"
         )
 
-    def _is_user_allowed(self, user_id: str, chat_type: str) -> bool:
+    def _is_user_allowed(self, user_id: str, chat_type: str, chat_id: str = "") -> bool:
         """Check if a user is allowed to interact with the bot."""
         if self.allow_all:
             return True
@@ -212,7 +217,10 @@ class YandexAdapter(BasePlatformAdapter):
             if self.group_policy == "disabled":
                 return False
             if self.group_policy == "allowlist":
-                return user_id in self.group_allow_from
+                # Accept either the sender's id or the chat's own id
+                # (``0/0/<guid>``) — the latter is how a feed channel that is
+                # written by other bots is allowlisted.
+                return user_id in self.group_allow_from or chat_id in self.group_allow_from
             return True  # "open"
 
         return True
@@ -556,13 +564,19 @@ class YandexAdapter(BasePlatformAdapter):
         sender = update.get("from") or {}
         chat = update.get("chat") or {}
 
-        # Ignore messages sent by bots (including our own) to avoid echo loops.
-        if sender.get("robot"):
-            return
+        chat_type_raw = chat.get("type")
+
+        # Ignore messages sent by OUR OWN bot (echo loop). Posts by OTHER bots
+        # are dropped too, unless allow_robot_senders is on and they land in a
+        # group/channel (reading a bot-written feed channel); robot DMs still
+        # fall through to the DM policy below.
         if self._bot_id and sender.get("id") == self._bot_id:
             return
+        if sender.get("robot") and not (
+            self.allow_robot_senders and chat_type_raw in ("group", "channel")
+        ):
+            return
 
-        chat_type_raw = chat.get("type")
         from_id = str(sender.get("id", ""))
         display_name = sender.get("display_name") or sender.get("login") or from_id
         login = sender.get("login") or ""
@@ -620,12 +634,18 @@ class YandexAdapter(BasePlatformAdapter):
                 thread_id = str(int(message_id))
                 self._pending_threads.add(thread_id)
 
+        # A bot-written feed channel is admitted by the chat-id group allowlist
+        # below and has no pairing code, so the auth gate must not swallow it.
+        robot_feed = bool(
+            self.allow_robot_senders and sender.get("robot") and chat_type == "group"
+        )
+
         # Admin-gated authorization. When enabled, the access gate is: admin
         # (recognized by login/user id) may always talk and may approve codes
         # with "/auth <code>"; approved-and-allowlisted users may talk; anyone
         # else is denied — a new private-chat user gets a pairing code (also
         # forwarded to the admin) and is otherwise not answered at all.
-        if self.auth_enabled:
+        if self.auth_enabled and not robot_feed:
             if self._is_auth_admin_user(from_id, login):
                 consumed = await self._handle_admin_message(
                     chat_id, from_id, display_name, text,
@@ -639,8 +659,10 @@ class YandexAdapter(BasePlatformAdapter):
                 return
 
         # Access control
-        if not self._is_user_allowed(user_id, chat_type):
-            logger.info("User %s not allowed (chat_type=%s)", user_id, chat_type)
+        if not self._is_user_allowed(user_id, chat_type, chat_id):
+            logger.info(
+                "User %s not allowed (chat_type=%s chat_id=%s)", user_id, chat_type, chat_id
+            )
             return
 
         # Remember how to address this chat on the way out.
@@ -891,6 +913,83 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     return seed
 
 
+# ── Out-of-process delivery (``hermes send`` / cron detached from the gateway) ──
+
+async def _standalone_send(
+    pconfig, chat_id: str, message: str, *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Send one text message through the Bot API without a running gateway.
+
+    A process that does not own a gateway adapter (``hermes send --to ym:...``,
+    a cron job spawned outside the gateway) reaches the platform through this
+    function instead of the live-adapter path. Media has no upload endpoint
+    here, so attachments are reported in the text rather than silently dropped.
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    token = os.getenv("YANDEX_BOT_TOKEN") or extra.get("token", "")
+    if not token:
+        return {"error": "Yandex Messenger standalone send: no token (set YANDEX_BOT_TOKEN)"}
+    if not chat_id:
+        return {"error": "Yandex Messenger standalone send: no chat_id"}
+
+    text = message or ""
+    if media_files:
+        note = f"[{len(media_files)} attachment(s) generated but not deliverable out-of-process]"
+        text = f"{text}\n{note}".strip()
+    if not text.strip():
+        return {"error": "Yandex Messenger standalone send: empty message"}
+    text = text[:MAX_MESSAGE_LENGTH]
+
+    # The core target parser only splits the platform prefix, so a thread
+    # arrives glued to the chat id — both as ``--to ym:<group>:<thread>`` and
+    # as the channel-directory entry ``0/0/<guid>:<thread>``. Split it back out.
+    if not thread_id and ":" in str(chat_id):
+        head, _, tail = str(chat_id).rpartition(":")
+        if head and tail.isdigit():
+            chat_id, thread_id = head, tail
+
+    params: Dict[str, Any] = {
+        "text": text,
+        "payload_id": f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+    }
+    # Group/channel → chat_id param; private chat → login param.
+    if _is_group_chat_id(chat_id):
+        params["chat_id"] = chat_id
+    else:
+        params["login"] = chat_id
+    if thread_id:
+        try:
+            params["thread_id"] = int(thread_id)
+        except (TypeError, ValueError):
+            return {"error": f"Yandex Messenger standalone send: bad thread_id {thread_id!r}"}
+
+    if aiohttp is None:  # AIOHTTP_AVAILABLE guard, narrowed for type checkers
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{YANDEX_API_BASE}messages/sendText/",
+                json=params,
+                headers={
+                    "Authorization": f"OAuth {token}",
+                    "Content-Type": "application/json",
+                },
+            ) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as exc:  # aiohttp errors, JSON errors, DNS, timeouts
+        logger.warning("Standalone sendText to %s failed: %s", chat_id, exc)
+        return {"error": f"Yandex Messenger standalone send failed: {exc}"}
+
+    if not data.get("ok", False):
+        return {"error": f"Yandex API error: {data.get('description', 'unknown')}"}
+    return {"success": True, "message_id": data.get("message_id")}
+
+
 def register(ctx):
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -902,6 +1001,8 @@ def register(ctx):
         required_env=["YANDEX_BOT_TOKEN"],
         install_hint="pip install aiohttp",
         env_enablement_fn=_env_enablement,
+        # Out-of-process delivery (hermes send / cron outside the gateway).
+        standalone_sender_fn=_standalone_send,
         cron_deliver_env_var="YANDEX_HOME_CHANNEL",
         allowed_users_env="YANDEX_ALLOWED_USERS",
         allow_all_env="YANDEX_ALLOW_ALL_USERS",
