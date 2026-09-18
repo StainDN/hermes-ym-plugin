@@ -568,6 +568,18 @@ class YandexAdapter(BasePlatformAdapter):
         """
         text = (update.get("text") or "").strip()
         if not text:
+            # Non-text updates (cards, files, stickers, membership events) carry
+            # no text and are skipped — log them so a silent drop of a real
+            # message (e.g. a bot's formatted error card) is diagnosable.
+            _u_chat = update.get("chat") or {}
+            _u_from = update.get("from") or {}
+            logger.info(
+                "ym non-text update ignored: chat=%s type=%s sender=%s robot=%s keys=%s payload=%s",
+                _u_chat.get("id"), _u_chat.get("type"),
+                _u_from.get("login") or _u_from.get("id"), _u_from.get("robot"),
+                sorted(update.keys()),
+                str({k: v for k, v in update.items() if k not in ("from", "chat")})[:300],
+            )
             return
 
         sender = update.get("from") or {}
@@ -699,6 +711,11 @@ class YandexAdapter(BasePlatformAdapter):
             user_name = display_name
             chat_name = display_name
             thread_id = None
+            # The group message id does not exist in the DM context: quoting it
+            # makes the Bot API reject the send ("resource not found"), so drop
+            # the reply anchor entirely.
+            message_id = ""
+            reply_to_message_id = None
 
         # Remember how to address this chat on the way out.
         self._chat_types[chat_id] = chat_type
