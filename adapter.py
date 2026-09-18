@@ -159,6 +159,15 @@ class YandexAdapter(BasePlatformAdapter):
         self.silent_dm_target = str(extra.get("silent_dm_target") or "")
         self.silent_dm_user_id = str(extra.get("silent_dm_user_id") or "")
         self.silent_dm_user_name = str(extra.get("silent_dm_user_name") or "")
+        # Mention-gated silent chats: only messages that actually mention one of
+        # ``silent_mention_ids`` are routed to the DM; everything else in those
+        # chats is dropped without waking the agent at all.
+        self.silent_mention_only_chats = [
+            str(c) for c in (extra.get("silent_mention_only_chats") or [])
+        ]
+        self.silent_mention_ids = [
+            str(c).lower() for c in (extra.get("silent_mention_ids") or [])
+        ]
 
         # Admin-gated authorization. When enabled, only the admin, users
         # already approved in the core PairingStore, and the explicit
@@ -199,6 +208,15 @@ class YandexAdapter(BasePlatformAdapter):
         # successful sendText). Typing indicator for these goes to the main
         # chat, because the thread doesn't exist on Yandex's side yet.
         self._pending_threads: set = set()
+
+    # ── Silent-chat mention gate ─────────────────────────────────────────
+
+    def _mentions_watched(self, text: str) -> bool:
+        """True when *text* mentions one of the watched users (``silent_mention_ids``)."""
+        if not text or not self.silent_mention_ids:
+            return False
+        low = text.lower()
+        return any(token and f"@{token}" in low for token in self.silent_mention_ids)
 
     # ── Access policy ────────────────────────────────────────────────────
 
@@ -691,6 +709,15 @@ class YandexAdapter(BasePlatformAdapter):
         # lands in the DM; when nothing is worth reporting the agent answers
         # NO_REPLY and the gateway suppresses delivery entirely.
         if chat_type == "group" and chat_id in self.silent_chats and self.silent_dm_target:
+            # Mention-gated chats (e.g. «Общий чат НСИ»): forward ONLY messages
+            # that actually mention the owner. Everything else is dropped here,
+            # so the agent isn't even woken — no cost, no DM noise.
+            if chat_id in self.silent_mention_only_chats and not self._mentions_watched(text):
+                logger.info(
+                    "ym silent chat %s: no mention of %s in %r — skipped",
+                    chat_id, self.silent_mention_ids, text[:80],
+                )
+                return
             title = await self._get_chat_title(chat_id)
             origin = f"«{title}»" if title and title != chat_id else chat_id
             author = display_name or from_id
