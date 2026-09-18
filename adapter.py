@@ -151,6 +151,15 @@ class YandexAdapter(BasePlatformAdapter):
         # subject to the DM policy, so this cannot open a private back door.
         self.allow_robot_senders = bool(extra.get("allow_robot_senders", False))
 
+        # Analysis-only ("silent") group chats: the bot READS them but never
+        # replies in the group — the analysis is routed to the owner's DM and
+        # the agent answers with a silent marker when nothing is worth
+        # reporting (the gateway drops such turns).
+        self.silent_chats = [str(c) for c in (extra.get("silent_chats") or [])]
+        self.silent_dm_target = str(extra.get("silent_dm_target") or "")
+        self.silent_dm_user_id = str(extra.get("silent_dm_user_id") or "")
+        self.silent_dm_user_name = str(extra.get("silent_dm_user_name") or "")
+
         # Admin-gated authorization. When enabled, only the admin, users
         # already approved in the core PairingStore, and the explicit
         # allowlists above may talk to the bot. New private-chat users get a
@@ -664,6 +673,32 @@ class YandexAdapter(BasePlatformAdapter):
                 "User %s not allowed (chat_type=%s chat_id=%s)", user_id, chat_type, chat_id
             )
             return
+
+        # Analysis-only ("silent") group chats: never answer in the group. The
+        # message is re-addressed to the owner's DM, so the agent's analysis
+        # lands in the DM; when nothing is worth reporting the agent answers
+        # NO_REPLY and the gateway suppresses delivery entirely.
+        if chat_type == "group" and chat_id in self.silent_chats and self.silent_dm_target:
+            title = await self._get_chat_title(chat_id)
+            origin = f"«{title}»" if title and title != chat_id else chat_id
+            author = display_name or from_id
+            display_text = (
+                f"[Пересылка из группового чата {origin}. Автор — {author}. "
+                "Это НЕ личное сообщение, и отвечать в группу нельзя: твой ответ "
+                "уйдёт Дмитрию в личку. Разбери сообщение по сути — если в нём "
+                "проблема, ошибка, вопрос или что-то, требующее действий Дмитрия, "
+                "дай краткий разбор (и следующий шаг, если он очевиден). Если "
+                "ничего существенного (рабочий трёп, обсуждение не по нашей части, "
+                "информационный шум) — ответь ровно NO_REPLY.]\n\n"
+                f"{text}"
+            )
+            chat_id = self.silent_dm_target
+            chat_type = "dm"
+            user_id = self.silent_dm_user_id or user_id
+            display_name = self.silent_dm_user_name or display_name
+            user_name = display_name
+            chat_name = display_name
+            thread_id = None
 
         # Remember how to address this chat on the way out.
         self._chat_types[chat_id] = chat_type
