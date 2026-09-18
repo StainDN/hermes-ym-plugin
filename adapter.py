@@ -808,6 +808,26 @@ class YandexAdapter(BasePlatformAdapter):
 
         content = content[:MAX_MESSAGE_LENGTH]
 
+        # Analysis-only ("silent") chats must never receive a public message.
+        # The inbound path already re-addresses such messages to the owner's DM,
+        # but a turn can still target the group directly: one accepted before
+        # the silent routing existed (queued over a gateway restart and
+        # auto-resumed afterwards), or a synthetic notice (shutdown, watch).
+        # Catch it at delivery time too and re-address it to the same DM.
+        if (
+            self.silent_dm_target
+            and chat_id != self.silent_dm_target
+            and chat_id in self.silent_chats
+        ):
+            logger.info(
+                "ym silent chat %s: re-addressing outgoing message to %s (len=%d)",
+                chat_id, self.silent_dm_target, len(content),
+            )
+            chat_id = self.silent_dm_target
+            reply_to = None
+            metadata = None
+            self._chat_types[chat_id] = "dm"
+
         params: Dict[str, Any] = {
             "text": content,
             "payload_id": f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
