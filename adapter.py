@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -78,6 +79,12 @@ PLATFORM_NAME = "ym"
 # Endpoints that the Yandex Bot API serves over GET only; everything else is
 # POST. Sending POST to these answers 405 "HTTP method POST not allowed".
 GET_METHODS = frozenset({"self/get", "chats/getChat"})
+
+# Authorization approval command typed by the admin: "/auth <code>". The code
+# is the 8-char pairing code produced by the Hermes core PairingStore.
+AUTH_APPROVE_RE = re.compile(r"^/?auth[ \t]+([A-Z0-9]{8})[ \t]*$", re.IGNORECASE)
+# Must match the core's PairingStore TTL (gateway/pairing.py CODE_TTL_SECONDS).
+AUTH_CODE_TTL = 3600
 
 
 def _is_group_chat_id(chat_id: str) -> bool:
@@ -139,6 +146,26 @@ class YandexAdapter(BasePlatformAdapter):
             self.allow_from = [uid.strip() for uid in env_allowed.split(",") if uid.strip()]
         self.allow_all = os.getenv("YANDEX_ALLOW_ALL_USERS", "").strip().lower() == "true"
 
+        # Admin-gated authorization. When enabled, only the admin, users
+        # already approved in the core PairingStore, and the explicit
+        # allowlists above may talk to the bot. New private-chat users get a
+        # pairing code, which is also forwarded to the admin; the admin
+        # approves with "/auth <code>" and the user is paired permanently.
+        self.auth_enabled = bool(extra.get("auth_enabled", False))
+        self.auth_admin_login = str(extra.get("auth_admin_login", "") or "").strip().lower()
+
+        # Back-reference injected by the gateway runner after creation so
+        # plugin adapters can reach core services (here: the PairingStore).
+        # See run.py _create_adapter: "gateway_runner" attribute injection.
+        self.gateway_runner = None
+        # Cached admin user id (GUID) — learned from the first admin message
+        # so the admin is recognized even if their login ever differs.
+        self._auth_admin_user_id: Optional[str] = None
+        # Codes handed out by this adapter: code -> request context. Kept in
+        # memory so "/auth" only ever hits codes we actually issued (a random
+        # string must not count as a failed approval against the core store).
+        self._issued_codes: Dict[str, Dict[str, Any]] = {}
+
         # Polling state
         self._offset: int = 0
         self._session: Optional[aiohttp.ClientSession] = None
@@ -163,7 +190,11 @@ class YandexAdapter(BasePlatformAdapter):
 
     @property
     def enforces_own_access_policy(self) -> bool:
-        return self.dm_policy == "allowlist" or self.group_policy == "allowlist"
+        return (
+            self.auth_enabled
+            or self.dm_policy == "allowlist"
+            or self.group_policy == "allowlist"
+        )
 
     def _is_user_allowed(self, user_id: str, chat_type: str) -> bool:
         """Check if a user is allowed to interact with the bot."""
@@ -294,6 +325,189 @@ class YandexAdapter(BasePlatformAdapter):
             logger.debug("Ignoring non-numeric thread_id: %s", raw)
             return None
 
+    # ── Admin-gated authorization ─────────────────────────────────────
+
+    def _pairing_store(self):
+        """Return the core PairingStore, or None when unavailable.
+
+        The store is reached through ``gateway_runner``, which the gateway
+        injects on plugin adapters that declare the attribute. Without it
+        (tests, unusual runtimes) authorization degrades to the plain
+        allowlist behaviour.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return None
+        store = getattr(runner, "pairing_store", None)
+        if store is None:
+            return None
+        return store
+
+    def _prune_issued_codes(self) -> None:
+        """Drop handed-out codes older than the core's code TTL."""
+        if not self._issued_codes:
+            return
+        now = time.time()
+        stale = [
+            code for code, ctx in self._issued_codes.items()
+            if now - ctx.get("issued_at", 0) > AUTH_CODE_TTL
+        ]
+        for code in stale:
+            self._issued_codes.pop(code, None)
+
+    def _is_auth_admin_user(self, from_id: str, login: str) -> bool:
+        """True when the sender is the configured authorization admin."""
+        if not self.auth_admin_login and self._auth_admin_user_id is None:
+            return False
+        if self._auth_admin_user_id and from_id == self._auth_admin_user_id:
+            return True
+        if login and self.auth_admin_login and login.strip().lower() == self.auth_admin_login:
+            return True
+        return False
+
+    def _approve_admin_in_core(self, from_id: str, display_name: str) -> None:
+        """Put the admin into the core approved list so forwarded messages pass.
+
+        The admin is trusted by login, not by a code, so instead of a pairing
+        exchange we add them to the PairingStore approved list directly
+        (``_approve_user`` must run under the store lock). No-op when the
+        store is unavailable.
+        """
+        store = self._pairing_store()
+        if store is None:
+            return
+        try:
+            with store._lock:
+                store._approve_user("ym", from_id, display_name)
+        except Exception:
+            logger.exception("Failed to auto-approve admin %s in pairing store", from_id)
+
+    async def _send_to_admin(self, text: str) -> None:
+        """Deliver a message to the admin's private chat by login."""
+        if not self.auth_admin_login:
+            return
+        try:
+            await self.send(self.auth_admin_login, text)
+        except Exception:
+            logger.exception("Failed to notify authorization admin")
+
+    def _parse_auth_code(self, text: str) -> Optional[str]:
+        """Extract the pairing code from an admin ``/auth <code>`` message."""
+        match = AUTH_APPROVE_RE.match(text.strip())
+        if not match:
+            return None
+        return match.group(1).upper()
+
+    async def _handle_admin_message(self, chat_id: str, from_id: str,
+                                    display_name: str, text: str) -> bool:
+        """Process an admin message that carries an approval command.
+
+        Returns True when the message was consumed as an authorization act
+        (the caller must NOT forward it to the core) and False when it is a
+        normal admin message that should flow through as usual.
+        """
+        if self._auth_admin_user_id is None:
+            self._auth_admin_user_id = from_id
+            self._approve_admin_in_core(from_id, display_name)
+
+        code = self._parse_auth_code(text)
+        if code is None:
+            return False
+
+        self._prune_issued_codes()
+        ctx = self._issued_codes.get(code)
+        store = self._pairing_store()
+        if store is None or ctx is None:
+            # Never call approve_code for codes we have not issued — a random
+            # string must not increment the core's failed-approval counter.
+            await self.send(chat_id, "Код не найден или устарел. Запросите новый код.")
+            return True
+
+        approved = store.approve_code("ym", code)
+        if not approved:
+            await self.send(chat_id, "Не удалось одобрить код. Попробуйте ещё раз.")
+            return True
+
+        self._issued_codes.pop(code, None)
+        user_id = approved.get("user_id") or ctx.get("user_id") or ""
+        user_name = approved.get("user_name") or ctx.get("user_name") or ""
+        logger.info(
+            "Authorization admin approved code for user %s (%s) on ym",
+            user_name, user_id,
+        )
+        await self.send(
+            chat_id, f"Доступ выдан. Пользователь: {user_name} ({ctx.get('login', '')}).",
+        )
+        user_login = ctx.get("login")
+        if user_login:
+            await self.send(user_login, "Вы авторизованы. Теперь можете общаться с ботом.")
+        return True
+
+    async def _handle_unauthorized_user(self, chat_id: str, from_id: str, login: str,
+                                        display_name: str, chat_type: str) -> None:
+        """Answer an unauthorized user with a pairing code (DMs only).
+
+        In group chats / channels unauthorized members get nothing at all.
+        """
+        if chat_type != "dm" or not login:
+            logger.info("Ignoring unauthorized user %s in %s", from_id, chat_type)
+            return
+
+        self._prune_issued_codes()
+        store = self._pairing_store()
+        if store is None:
+            logger.info("Pairing store unavailable — ignoring unauthorized user %s", from_id)
+            return
+
+        code = store.generate_code("ym", from_id, display_name)
+        if not code:
+            logger.info(
+                "Pairing code not issued for %s (rate-limited/lockout/limit)", from_id
+            )
+            return
+
+        # Keep the code in memory so /auth only approves codes we know about.
+        self._issued_codes[code.upper()] = {
+            "login": login,
+            "user_id": from_id,
+            "user_name": display_name,
+            "issued_at": time.time(),
+        }
+        logger.info("Issued authorization code for new user %s on ym", from_id)
+
+        await self.send(
+            chat_id,
+            f"Доступ к боту ограничен.\n\n"
+            f"Ваш код авторизации: {code}\n\n"
+            f"Передайте его администратору — после подтверждения вы сможете пользоваться ботом.",
+        )
+        await self._send_to_admin(
+            f"Запрос на авторизацию:\n"
+            f"Имя: {display_name}\n"
+            f"Логин: {login}\n"
+            f"ID: {from_id}\n"
+            f"Код: {code}\n\n"
+            f"Для одобрения отправьте: /auth {code}",
+        )
+
+    def _is_user_authorized_local(self, from_id: str) -> bool:
+        """Whether a non-admin sender may interact with the bot.
+
+        True for core-approved (paired) users and the explicit allowlist /
+        allow-all admittance. Otherwise False — a new user must be paired.
+        """
+        if self.allow_all:
+            return True
+        if from_id in self.allow_from:
+            return True
+        store = self._pairing_store()
+        if store is not None:
+            try:
+                return bool(store.is_approved("ym", from_id))
+            except Exception:
+                logger.exception("Failed to check pairing store for %s", from_id)
+        return False
+
     # ── Polling loop ───────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
@@ -351,6 +565,7 @@ class YandexAdapter(BasePlatformAdapter):
         chat_type_raw = chat.get("type")
         from_id = str(sender.get("id", ""))
         display_name = sender.get("display_name") or sender.get("login") or from_id
+        login = sender.get("login") or ""
         message_id = update.get("message_id", 0)
 
         # Messages inside a thread carry a ``thread_id`` in the ``chat`` object.
@@ -404,6 +619,24 @@ class YandexAdapter(BasePlatformAdapter):
             if auto_thread and message_id:
                 thread_id = str(int(message_id))
                 self._pending_threads.add(thread_id)
+
+        # Admin-gated authorization. When enabled, the access gate is: admin
+        # (recognized by login/user id) may always talk and may approve codes
+        # with "/auth <code>"; approved-and-allowlisted users may talk; anyone
+        # else is denied — a new private-chat user gets a pairing code (also
+        # forwarded to the admin) and is otherwise not answered at all.
+        if self.auth_enabled:
+            if self._is_auth_admin_user(from_id, login):
+                consumed = await self._handle_admin_message(
+                    chat_id, from_id, display_name, text,
+                )
+                if consumed:
+                    return
+            elif not self._is_user_authorized_local(user_id):
+                await self._handle_unauthorized_user(
+                    chat_id, from_id, login, display_name, chat_type,
+                )
+                return
 
         # Access control
         if not self._is_user_allowed(user_id, chat_type):
@@ -479,6 +712,11 @@ class YandexAdapter(BasePlatformAdapter):
             "Yandex Messenger adapter connected (dm_policy=%s, group_policy=%s)",
             self.dm_policy, self.group_policy,
         )
+        if self.auth_enabled and not self.auth_admin_login:
+            logger.error(
+                "auth_enabled is true but auth_admin_login is not set — "
+                "no one can approve pairing codes; set extra.auth_admin_login"
+            )
         return True
 
     async def disconnect(self) -> None:
