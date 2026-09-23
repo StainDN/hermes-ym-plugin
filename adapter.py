@@ -378,6 +378,32 @@ class YandexAdapter(BasePlatformAdapter):
             return None
         return store
 
+    def _user_authorized_by_policy(self, user_id: str, chat_type: str,
+                                   chat_id: str) -> bool:
+        """Authorization check that does NOT depend on the PairingStore.
+
+        Used as a fallback when ``gateway_runner`` is not injected (the store
+        is unreachable): the access policy — allowlists, the group
+        chat-id allowlist (bot-written feed channels) and
+        ``allow_robot_senders`` — still decides, instead of everyone being
+        silently rejected.
+        """
+        # An already-paired user keeps access through the core store;
+        # without the store we only know the policy lists.
+        if chat_type == "dm":
+            if self.dm_policy == "disabled":
+                return False
+            if self.dm_policy == "allowlist":
+                return user_id in self.allow_from
+            return True
+        if chat_type == "group":
+            if self.group_policy == "disabled":
+                return False
+            if self.group_policy == "allowlist":
+                return user_id in self.group_allow_from or chat_id in self.group_allow_from
+            return True
+        return True
+
     def _prune_issued_codes(self) -> None:
         """Drop handed-out codes older than the core's code TTL."""
         if not self._issued_codes:
@@ -692,10 +718,18 @@ class YandexAdapter(BasePlatformAdapter):
                 if consumed:
                     return
             elif not self._is_user_authorized_local(user_id):
-                await self._handle_unauthorized_user(
-                    chat_id, from_id, login, display_name, chat_type,
-                )
-                return
+                # Fallback: without an injected PairingStore nobody is
+                # "paired", so decide by the access policy alone (this is how
+                # a bot-written feed channel — allowed by chat id — is kept).
+                if self._pairing_store() is None and self._user_authorized_by_policy(
+                    user_id, chat_type, chat_id,
+                ):
+                    pass
+                else:
+                    await self._handle_unauthorized_user(
+                        chat_id, from_id, login, display_name, chat_type,
+                    )
+                    return
 
         # Access control
         if not self._is_user_allowed(user_id, chat_type, chat_id):
